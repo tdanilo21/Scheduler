@@ -51,7 +51,7 @@ class CAction(Action):
         result = subprocess.run([compiler, self.cmd, "-o", executable], shell=True, cwd=directory)
         if result.returncode != 0:
             raise RuntimeError("Compilation failed.")
-        subprocess.run([executable], shell=True, cwd=directory)
+        subprocess.run(("" if os.name == "nt" else "./") + executable, shell=True, cwd=directory)
 
 class ActionFactory:
     @staticmethod
@@ -63,7 +63,7 @@ class ActionFactory:
                 return ScriptAction(cmd)
             case "python":
                 return PythonAction(cmd)
-            case "C":
+            case "c":
                 return CAction(cmd)
             case _:
                 return None
@@ -138,10 +138,10 @@ def get_dependencies(target):
                 q.append(u)
     return visited
 
-def build(target):
-    if target not in nodes.keys():
+def build(target_id):
+    if target_id not in nodes.keys():
         return False
-    deps = get_dependencies(nodes[target])
+    deps = get_dependencies(nodes[target_id])
     from collections import deque
     q = deque()
     deg = {}
@@ -161,7 +161,7 @@ def build(target):
                     q.append(v)
     return True
 
-def clear():
+def clean():
     for node in nodes.values():
         for output in node.outputs:
             output_path = os.path.join(directory, output)
@@ -184,8 +184,8 @@ while True:
                 print("Build completed successfully.")
             else:
                 print("Build failed.")
-        case "clear":
-            clear()
+        case "clean":
+            clean()
             print("Outputs cleared.")
         case "exit":
             break

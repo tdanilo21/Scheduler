@@ -12,7 +12,7 @@
         "type": "script",
         "cmd": "script.cmd"
       },
-      "outputs": ["data/"],
+      "outputs": ["data/", "data/example.txt"],
       "resources": {
         "CPU": 1,
         "RAM": 0.1
@@ -22,7 +22,7 @@
       "id": "run A",
       "deps": ["make dir data"],
       "action": {
-        "type": "C",
+        "type": "c",
         "cmd": "a.c"
       },
       "outputs": ["a.exe", "data/a.txt"],
