@@ -63,7 +63,7 @@ class ActionFactory:
                 return ScriptAction(cmd)
             case "python":
                 return PythonAction(cmd)
-            case "c":
+            case "C":
                 return CAction(cmd)
             case _:
                 return None
@@ -125,41 +125,39 @@ def load(file_path):
     return True
 
 def get_dependencies(target):
-    visited = {node_id: False for node_id in nodes.keys()}
+    visited = set()
     from collections import deque
     q = deque()
-    visited[target.id] = True
+    visited.add(target)
     q.append(target)
     while q:
         s = q.popleft()
         for u in s.inverted_edges:
-            if not visited[u.id]:
-                visited[u.id] = True
+            if u not in visited:
+                visited.add(u)
                 q.append(u)
     return visited
 
 def build(target):
     if target not in nodes.keys():
         return False
-    s = nodes[target]
-    visited = get_dependencies(s)
+    deps = get_dependencies(nodes[target])
     from collections import deque
     q = deque()
-    deg = {node_id: 0 for node_id, v in visited.items() if v}
-    for node_id, v in visited.items():
-        if v:
-            deg[node_id] = len(nodes[node_id].inverted_edges)
-            if deg[node_id] == 0:
-                q.append(nodes[node_id])
+    deg = {}
+    for node in deps:
+        deg[node] = len(node.inverted_edges)
+        if deg[node] == 0:
+            q.append(node)
     while q:
         u = q.popleft()
         if u.action:
             print(f"Running action for node {u.id}...")
             u.action.run()
         for v in u.edges:
-            if visited[v.id]:
-                deg[v.id] -= 1
-                if deg[v.id] == 0:
+            if v in deps:
+                deg[v] -= 1
+                if deg[v] == 0:
                     q.append(v)
     return True
 
