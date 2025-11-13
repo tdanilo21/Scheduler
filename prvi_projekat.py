@@ -119,6 +119,19 @@ class Node:
         self.state = State.RUNNING
         self.mutex.release()
 
+    def clean(self):
+        self.mutex.acquire()
+        self.state = State.PENDING
+        self.degree = len(self.inverted_edges)
+        self.mutex.release()
+        for output in self.outputs:
+            output_path = os.path.join(directory, output)
+            if os.path.isfile(output_path):
+                os.remove(output_path)
+            elif os.path.isdir(output_path):
+                import shutil
+                shutil.rmtree(output_path)
+
     def read_state(self):
         self.mutex.acquire()
         state = self.state
@@ -345,19 +358,26 @@ class PlannerThread(threading.Thread):
             self.notification_queue_lock.release()
         planner_threads.pop(self.id)
 
-def clean():
-    for node in nodes.values():
-        node.mutex.acquire()
-        node.state = State.PENDING
-        node.degree = len(node.inverted_edges)
-        node.mutex.release()
-        for output in node.outputs:
-            output_path = os.path.join(directory, output)
-            if os.path.isfile(output_path):
-                os.remove(output_path)
-            elif os.path.isdir(output_path):
-                import shutil
-                shutil.rmtree(output_path)
+def clean(target_id=None):
+    queue = deque()
+    visited = {id: False for id in nodes.keys()}
+    if target_id:
+        if target_id not in nodes:
+            return
+        queue.append(nodes[target_id])
+        visited[target_id] = True
+    else:
+        for node in nodes.values():
+            if not node.inverted_edges:
+                queue.append(node)
+                visited[node.id] = True
+    while queue:
+        node = queue.popleft()
+        node.clean()
+        for neighbor in node.edges:
+            if not visited[neighbor.id]:
+                visited[neighbor.id] = True
+                queue.append(neighbor)
 
 while True:
     cmd = input("> ").strip().split(maxsplit=1)
@@ -372,8 +392,14 @@ while True:
             planner_threads[thread.id] = thread
             thread.start()
         case "clean":
-            pool.terminate()
-            clean()
+            if planner_threads:
+                print("Builds are in progress. Clean aborted.")
+                continue
+            confirmation = input("Are you sure you want to clean all outputs? (y/n): ").strip().lower()
+            if confirmation != 'y':
+                print("Clean aborted.")
+                continue
+            clean(cmd[1] if len(cmd) > 1 else None)
             print("Outputs cleaned.")
         case "exit":
             pool.close()
