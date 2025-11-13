@@ -110,14 +110,33 @@ class Node:
         if self.degree == 0 and (self.state == State.PENDING or self.state == State.FAILED):
             self.state = State.READY
             self.mutex.release()
-            return True
+            return 1 # send to execution
+        if self.state == State.DONE:
+            self.mutex.release()
+            return 2 # done, move on
         self.mutex.release()
-        return False
+        return 0 # do nothing
     
     def mark_running(self):
         self.mutex.acquire()
         self.state = State.RUNNING
         self.mutex.release()
+
+    def clean(self):
+        self.mutex.acquire()
+        self.state = State.PENDING
+        self.mutex.release()
+        for neighbor in self.edges:
+            neighbor.mutex.acquire()
+            neighbor.degree += 1
+            neighbor.mutex.release()
+        for output in self.outputs:
+            output_path = os.path.join(directory, output)
+            if os.path.isfile(output_path):
+                os.remove(output_path)
+            elif os.path.isdir(output_path):
+                import shutil
+                shutil.rmtree(output_path)
 
     def read_state(self):
         self.mutex.acquire()
@@ -256,6 +275,7 @@ class PlannerThread(threading.Thread):
     def __init__(self, target_id):
         super().__init__(target=self.build)
         self.target_id = target_id
+        self.target = nodes[self.target_id]
         PlannerThread.counter_lock.acquire()
         self.id = PlannerThread.counter
         PlannerThread.counter += 1
@@ -268,10 +288,9 @@ class PlannerThread(threading.Thread):
         self.deps = set()
         self.finished = False
 
-        target = nodes[self.target_id]
         q = deque()
-        self.deps.add(target)
-        q.append(target)
+        self.deps.add(self.target)
+        q.append(self.target)
         while q:
             s = q.popleft()
             for u in s.inverted_edges:
@@ -302,18 +321,28 @@ class PlannerThread(threading.Thread):
         if node.read_state() == State.FAILED or node.id == self.target_id:
             self.finished = True
             return
-        for neighbor in node.edges:
-            if (neighbor in self.deps 
-                and ((node in self.executed_nodes and neighbor.update()) 
-                or (node not in self.executed_nodes and neighbor.try_build()))):
-                self.node_queue.append(neighbor)
+        if node in self.executed_nodes:
+            for neighbor in node.edges:
+                if neighbor in self.deps and neighbor.update():
+                    self.node_queue.append(neighbor)
+        else:
+            for neighbor in node.edges:
+                if neighbor in self.deps:
+                    result = neighbor.try_build()
+                    if result == 1:
+                        self.node_queue.append(neighbor)
+                    elif result == 2:
+                        self.process_notification(neighbor)
 
     def build(self):
         if self.target_id not in nodes.keys():
-            return False
+            planner_threads.pop(self.id)
+            return
         for node in self.deps:
-            if node.try_build():
+            if node.try_build() == 1:
                 self.node_queue.append(node)
+        if self.target.read_state() == State.DONE:
+            self.finished = True
         while not self.finished:
             while self.node_queue:
                 node = self.node_queue.popleft()
@@ -345,19 +374,26 @@ class PlannerThread(threading.Thread):
             self.notification_queue_lock.release()
         planner_threads.pop(self.id)
 
-def clean():
-    for node in nodes.values():
-        node.mutex.acquire()
-        node.state = State.PENDING
-        node.degree = len(node.inverted_edges)
-        node.mutex.release()
-        for output in node.outputs:
-            output_path = os.path.join(directory, output)
-            if os.path.isfile(output_path):
-                os.remove(output_path)
-            elif os.path.isdir(output_path):
-                import shutil
-                shutil.rmtree(output_path)
+def clean(target_id=None):
+    queue = deque()
+    visited = {id: False for id in nodes.keys()}
+    if target_id:
+        if target_id not in nodes:
+            return
+        queue.append(nodes[target_id])
+        visited[target_id] = True
+    else:
+        for node in nodes.values():
+            if not node.inverted_edges:
+                queue.append(node)
+                visited[node.id] = True
+    while queue:
+        node = queue.popleft()
+        node.clean()
+        for neighbor in node.edges:
+            if not visited[neighbor.id]:
+                visited[neighbor.id] = True
+                queue.append(neighbor)
 
 while True:
     cmd = input("> ").strip().split(maxsplit=1)
@@ -372,8 +408,14 @@ while True:
             planner_threads[thread.id] = thread
             thread.start()
         case "clean":
-            pool.terminate()
-            clean()
+            if planner_threads:
+                print("Builds are in progress. Clean aborted.")
+                continue
+            confirmation = input("Are you sure you want to clean all outputs? (y/n): ").strip().lower()
+            if confirmation != 'y':
+                print("Clean aborted.")
+                continue
+            clean(cmd[1] if len(cmd) > 1 else None)
             print("Outputs cleaned.")
         case "exit":
             pool.close()
