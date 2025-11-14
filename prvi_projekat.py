@@ -3,8 +3,7 @@ import os
 from enum import Enum, auto
 import threading
 from collections import deque
-
-directory = ""
+import multiprocessing
 
 @dataclass
 class Resources:
@@ -12,41 +11,38 @@ class Resources:
     RAM: float
 
 class Action:
-    def __init__(self, cmd):
+    def __init__(self, cmd, cwd):
         self.cmd = cmd
+        self.cwd = cwd
 
     def run(self):
         pass
 
 class ShellAction(Action):
-    def __init__(self, cmd):
-        super().__init__(cmd)
+    def __init__(self, cmd, cwd):
+        super().__init__(cmd, cwd)
     
     def run(self):
         import subprocess
-        result = subprocess.run(self.cmd, shell=True, cwd=directory, capture_output=True, text=True)
+        result = subprocess.run(self.cmd, shell=True, cwd=self.cwd, capture_output=True, text=True)
         if result.returncode != 0:
             raise Exception(result.stderr)
         return result.stdout
-        
-class ScriptAction(ShellAction):
-    def __init__(self, cmd):
-        super().__init__("start /min cmd /c " + cmd)
 
 class PythonAction(Action):
-    def __init__(self, cmd):
-        super().__init__(cmd)
+    def __init__(self, cmd, cwd):
+        super().__init__(cmd, cwd)
 
     def run(self):
         import subprocess
-        result = subprocess.run(["py", self.cmd], cwd=directory, capture_output=True, text=True)
+        result = subprocess.run(["py", self.cmd], cwd=self.cwd, capture_output=True, text=True)
         if result.returncode != 0:
             raise Exception(result.stderr)
         return result.stdout
 
 class CAction(Action):
-    def __init__(self, cmd):
-        super().__init__(cmd)
+    def __init__(self, cmd, cwd):
+        super().__init__(cmd, cwd)
 
     def run(self):
         import subprocess
@@ -57,26 +53,24 @@ class CAction(Action):
             raise EnvironmentError("No C compiler found in PATH")
         base, _ = os.path.splitext(self.cmd)
         executable = base + (".exe" if os.name == "nt" else "")
-        result = subprocess.run([compiler, self.cmd, "-o", executable], cwd=directory, capture_output=True, text=True)
+        result = subprocess.run([compiler, self.cmd, "-o", executable], cwd=self.cwd, capture_output=True, text=True)
         if result.returncode != 0:
             raise Exception(result.stderr)
-        result = subprocess.run([("" if os.name == "nt" else "./") + executable], cwd=directory, shell=True, capture_output=True, text=True)
+        result = subprocess.run([("" if os.name == "nt" else "./") + executable], cwd=self.cwd, shell=True, capture_output=True, text=True)
         if result.returncode != 0:
             raise Exception(result.stderr)
         return result.stdout
 
 class ActionFactory:
     @staticmethod
-    def create_action(action_type, cmd):
+    def create_action(action_type, cmd, cwd):
         match action_type:
             case "shell":
-                return ShellAction(cmd)
-            case "script":
-                return ScriptAction(cmd)
+                return ShellAction(cmd, cwd)
             case "python":
-                return PythonAction(cmd)
+                return PythonAction(cmd, cwd)
             case "c":
-                return CAction(cmd)
+                return CAction(cmd, cwd)
             case _:
                 return None
             
@@ -138,7 +132,7 @@ class Node:
         self.error_message = None
         self.error_message_lock.release()
         for output in self.outputs:
-            output_path = os.path.join(directory, output)
+            output_path = os.path.join(self.action.cwd, output)
             if os.path.isfile(output_path):
                 os.remove(output_path)
             elif os.path.isdir(output_path):
@@ -204,7 +198,7 @@ class Future:
 
 class RAFThreadPool:
     def __init__(self, max_workers):
-        self.max_workers = max_workers
+        self._max_workers = max_workers
         self.workers = []
         self.active_workers = 0
         self.active_workers_lock = threading.Lock()
@@ -288,23 +282,72 @@ class RAFThreadPool:
 
     def num_active_workers(self):
         return self.active_workers
+
+    def max_workers(self):
+        return self._max_workers
     
     def is_closed(self):
         return self.closed
+    
+def wrapper_task(func, args, active_workers, active_workers_lock):
+    active_workers_lock.acquire()
+    active_workers.value += 1
+    active_workers_lock.release()
+    result = func(*args)
+    active_workers_lock.acquire()
+    active_workers.value -= 1
+    active_workers_lock.release()
+    return result
+    
+class RAFProcessPoll():
+    def __init__(self, max_workers=None):
+        self.pool = multiprocessing.Pool(processes=max_workers)
+        self.closed = False
+        manager = multiprocessing.Manager()
+        self.active_workers = manager.Value('i', 0)
+        self.active_workers_lock = manager.Lock()
 
-pool = RAFThreadPool(max_workers=10)
-nodes = {}
-capacity = {}
-free_resources = {}
-resources_lock = threading.Lock()
-targets = []
-planner_threads = {}
-planner_threads_lock = threading.Lock()
-stop_event = threading.Event()
+    def apply_async(self, func, args=(), callback=None, callback_args=(), err_callback=None, err_callback_args=()):
+        self.pool.apply_async(
+            func=wrapper_task,
+            args=(func, args, self.active_workers, self.active_workers_lock),
+            callback=lambda res: callback(res, *callback_args),
+            error_callback=lambda exc: err_callback(exc, *err_callback_args)
+        )
 
-print_queue = deque()
-print_queue_lock = threading.Lock()
-print_queue_semaphore = threading.Semaphore(0)
+    def close(self):
+        self.pool.close()
+        self.closed = True
+
+    def join(self):
+        self.pool.join()
+
+    def terminate(self):
+        self.pool.terminate()
+
+    def num_active_workers(self):
+        return self.active_workers.value
+    
+    def max_workers(self):
+        return self.pool._processes
+    
+    def is_closed(self):
+        return self.is_closed
+    
+if __name__ == "__main__":
+    pool = RAFThreadPool(10)
+    nodes = {}
+    capacity = {}
+    free_resources = {}
+    resources_lock = threading.Lock()
+    targets = []
+    planner_threads = {}
+    planner_threads_lock = threading.Lock()
+    stop_event = threading.Event()
+
+    print_queue = deque()
+    print_queue_lock = threading.Lock()
+    print_queue_semaphore = threading.Semaphore(0)
 
 def print_thread_safe(message):
     print_queue_lock.acquire()
@@ -313,39 +356,43 @@ def print_thread_safe(message):
     print_queue_semaphore.release()
 
 def load(file_path):
-    global nodes, capacity, free_resources, targets, directory
+    global nodes, capacity, free_resources, targets
     from pathlib import Path
     directory = Path(file_path).parent.resolve()
     import json
-    with open(file_path, 'r') as file:
-        data = json.load(file)
-        capacity = Resources(data['capacity']['CPU'], data['capacity']['RAM'])
-        free_resources = Resources(data['capacity']['CPU'], data['capacity']['RAM'])
-        targets = data['targets']
-        for node_data in data['nodes']:
-            node = Node(
-                id=node_data['id'],
-                action=ActionFactory.create_action(node_data['action']['type'], node_data['action']['cmd']) if node_data['action'] else None,
-                outputs=node_data['outputs'],
-                resources=Resources(node_data['resources']['CPU'], node_data['resources']['RAM'])
-            )
-            if node.resources.CPU > capacity.CPU or node.resources.RAM > capacity.RAM:
-                print_thread_safe(f"There is not enough resources for node {node.id}")
-                print_thread_safe(None)
-                nodes = {}
-                capacity = {}
-                targets = []
-                directory = ""
-                return
-            nodes[node.id] = node
+    try:
+        with open(file_path, 'r') as file:
+            data = json.load(file)
+            capacity = Resources(data['capacity']['CPU'], data['capacity']['RAM'])
+            free_resources = Resources(data['capacity']['CPU'], data['capacity']['RAM'])
+            targets = data['targets']
+            for node_data in data['nodes']:
+                node = Node(
+                    id=node_data['id'],
+                    action=ActionFactory.create_action(node_data['action']['type'], node_data['action']['cmd'], directory) if node_data['action'] else None,
+                    outputs=node_data['outputs'],
+                    resources=Resources(node_data['resources']['CPU'], node_data['resources']['RAM'])
+                )
+                if node.resources.CPU > capacity.CPU or node.resources.RAM > capacity.RAM:
+                    print_thread_safe(f"There is not enough resources for node {node.id}")
+                    print_thread_safe(None)
+                    nodes = {}
+                    capacity = {}
+                    targets = []
+                    directory = ""
+                    return
+                nodes[node.id] = node
+            print_thread_safe(None)
+            for node_data in data['nodes']:
+                node = nodes[node_data['id']]
+                for neighbor_id in node_data['deps']:
+                    neighbor = nodes[neighbor_id]
+                    neighbor.add_edge(node)
+        for node in nodes.values():
+            node.update(0)
+    except FileNotFoundError as e:
+        print_thread_safe(str(e))
         print_thread_safe(None)
-        for node_data in data['nodes']:
-            node = nodes[node_data['id']]
-            for neighbor_id in node_data['deps']:
-                neighbor = nodes[neighbor_id]
-                neighbor.add_edge(node)
-    for node in nodes.values():
-        node.update(0)
 
 class PlannerThread(threading.Thread):
     counter = 0
@@ -533,7 +580,7 @@ def stats():
     for state in State:
         print_thread_safe(f"  {state.name}: {cnt[state]}")
     print_thread_safe(f"Resources in use: CPU {resources_in_use.CPU}/{capacity.CPU}, RAM {resources_in_use.RAM}/{capacity.RAM}")
-    print_thread_safe(f"Active pool workers: {pool.num_active_workers()}/{pool.max_workers}")
+    print_thread_safe(f"Active pool workers: {pool.num_active_workers()}/{pool.max_workers()}")
     print_thread_safe(f"Active planner threads: {current_planner_threads}")
     print_thread_safe(None)
 
@@ -644,10 +691,14 @@ def output():
             print(message)
         print_queue_lock.release()
 
-while True:
-    result = command_input()
-    if result == 2:
-        break
-    if result == 1:
-        continue
-    output()
+def console():
+    while True:
+        result = command_input()
+        if result == 2:
+            break
+        if result == 1:
+            continue
+        output()
+
+if __name__ == "__main__":
+    console()
