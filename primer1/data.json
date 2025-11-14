@@ -64,7 +64,7 @@
         "type": "shell",
         "cmd": "final.exe"
       },
-      "outputs": ["data/result.txt"],
+      "outputs": ["data/final.txt"],
       "resources": {
         "CPU": 2,
         "RAM": 0.5

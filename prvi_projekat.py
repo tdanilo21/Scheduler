@@ -89,42 +89,41 @@ class Node:
         self.state = State.PENDING
         self.degree = 0
         self.mutex = threading.Lock()
+        self.error_message = None
+        self.error_message_lock = threading.Lock()
 
     def add_edge(self, node):
         self.edges.append(node)
         node.inverted_edges.append(self)
         node.degree += 1
 
-    def update(self):
+    def update(self, delta):
         self.mutex.acquire()
-        self.degree -= 1
+        self.degree -= delta
         if self.degree == 0:
             self.state = State.READY
-            self.mutex.release()
-            return True
         self.mutex.release()
-        return False
 
     def try_build(self):
         self.mutex.acquire()
-        if self.degree == 0 and (self.state == State.PENDING or self.state == State.FAILED):
-            self.state = State.READY
+        if self.state == State.READY or self.state == State.FAILED:
+            self.state = State.RUNNING
             self.mutex.release()
-            return 1 # send to execution
+            return 1
         if self.state == State.DONE:
             self.mutex.release()
-            return 2 # done, move on
+            return 2
         self.mutex.release()
-        return 0 # do nothing
+        return 0
     
-    def mark_running(self):
+    def set_state(self, state):
         self.mutex.acquire()
-        self.state = State.RUNNING
+        self.state = state
         self.mutex.release()
 
     def clean(self):
         self.mutex.acquire()
-        self.state = State.PENDING
+        self.state = State.PENDING if self.degree > 0 else State.READY
         self.mutex.release()
         for neighbor in self.edges:
             neighbor.mutex.acquire()
@@ -143,21 +142,30 @@ class Node:
         state = self.state
         self.mutex.release()
         return state
+    
+    def read_degree(self):
+        self.mutex.acquire()
+        degree = self.degree
+        self.mutex.release()
+        return degree
+    
+    def set_error_message(self, message):
+        self.error_message_lock.acquire()
+        self.error_message = message
+        self.error_message_lock.release()
 
-    def print_node(self):
-        print(f"Node ID: {self.id}")
-        print(f"Action: {self.action}")
-        print(f"Outputs: {self.outputs}")
-        print(f"Resources: {self.resources}")
-        print("Edges to:")
-        for edge in self.edges:
-            print(f"  - Node ID: {edge.id}")
+    def get_error_message(self):
+        self.error_message_lock.acquire()
+        message = self.error_message
+        self.error_message_lock.release()
+        return message
 
 class RAFThreadPool:
     def __init__(self, max_workers):
         self.max_workers = max_workers
         self.workers = []
         self.active_workers = 0
+        self.active_workers_lock = threading.Lock()
         self.queue = deque()
         self.queue_lock = threading.Lock()
         self.semaphore = threading.Semaphore(0)
@@ -195,7 +203,13 @@ class RAFThreadPool:
             self.queue_lock.acquire()
             task = self.queue.popleft()
             self.queue_lock.release()
+            self.active_workers_lock.acquire()
+            self.active_workers += 1
+            self.active_workers_lock.release()
             task.execute()
+            self.active_workers_lock.acquire()
+            self.active_workers -= 1
+            self.active_workers_lock.release()
             
     def apply_async(self, func, args=(), callback=None, callback_args=(), err_callback=None, err_callback_args=()):
         if self.closed:
@@ -236,6 +250,18 @@ free_resources = {}
 resources_lock = threading.Lock()
 targets = []
 planner_threads = {}
+planner_threads_lock = threading.Lock()
+stop_event = threading.Event()
+
+print_queue = deque()
+print_queue_lock = threading.Lock()
+print_queue_semaphore = threading.Semaphore(0)
+
+def print_thread_safe(message):
+    print_queue_lock.acquire()
+    print_queue.append(message)
+    print_queue_lock.release()
+    print_queue_semaphore.release()
 
 def load(file_path):
     global nodes, capacity, free_resources, targets, directory
@@ -255,27 +281,33 @@ def load(file_path):
                 resources=Resources(node_data['resources']['CPU'], node_data['resources']['RAM'])
             )
             if node.resources.CPU > capacity.CPU or node.resources.RAM > capacity.RAM:
+                print_thread_safe(f"There is not enough resources for node {node.id}")
+                print_thread_safe(None)
                 nodes = {}
                 capacity = {}
                 targets = []
                 directory = ""
-                return False
+                return
             nodes[node.id] = node
+        print_thread_safe(None)
         for node_data in data['nodes']:
             node = nodes[node_data['id']]
             for neighbor_id in node_data['deps']:
                 neighbor = nodes[neighbor_id]
                 neighbor.add_edge(node)
-    return True
+    for node in nodes.values():
+        node.update(0)
 
 class PlannerThread(threading.Thread):
     counter = 0
     counter_lock = threading.Lock()
 
-    def __init__(self, target_id):
+    def __init__(self, target_id, stop_event, p):
         super().__init__(target=self.build)
         self.target_id = target_id
         self.target = nodes[self.target_id]
+        self.stop_event = stop_event
+        self.p = p
         PlannerThread.counter_lock.acquire()
         self.id = PlannerThread.counter
         PlannerThread.counter += 1
@@ -299,14 +331,19 @@ class PlannerThread(threading.Thread):
                     q.append(u)
 
     def taks_completed(self, _, node):
-        print(f"{node.id} completed.")
-        self.task_executed(_, node)
+        node.set_state(State.DONE)
+        if self.p:
+            print_thread_safe(f"{node.id} completed.")
+        self.task_executed(node)
     
-    def task_failed(self, _, node):
-        print(f"{node.id} failed.")
-        self.task_executed(_, node)
+    def task_failed(self, result, node):
+        node.set_state(State.FAILED)
+        if self.p:
+            print_thread_safe(f"{node.id} failed with error code {result.returncode}.")
+        node.set_error_message(result.stderr)
+        self.task_executed(node)
     
-    def task_executed(self, _, node):
+    def task_executed(self, node):
         resources_lock.acquire()
         free_resources.CPU += node.resources.CPU
         free_resources.RAM += node.resources.RAM
@@ -317,44 +354,43 @@ class PlannerThread(threading.Thread):
             thread.notification_queue_lock.release()
             thread.notification_queue_semaphore.release()
 
+    def node_queue_append(self, node):
+        if not node.action:
+            self.taks_completed(None, node)
+        else:
+            self.node_queue.append(node)
+
     def process_notification(self, node):
         if node.read_state() == State.FAILED or node.id == self.target_id:
             self.finished = True
-            return
         if node in self.executed_nodes:
             for neighbor in node.edges:
-                if neighbor in self.deps and neighbor.update():
-                    self.node_queue.append(neighbor)
-        else:
-            for neighbor in node.edges:
-                if neighbor in self.deps:
-                    result = neighbor.try_build()
-                    if result == 1:
-                        self.node_queue.append(neighbor)
-                    elif result == 2:
-                        self.process_notification(neighbor)
+                neighbor.update(1)
+        for neighbor in node.edges:
+            if neighbor in self.deps:
+                result = neighbor.try_build()
+                if result == 1:
+                    self.node_queue_append(neighbor)
+                elif result == 2:
+                    self.process_notification(neighbor)
 
-    def build(self):
-        if self.target_id not in nodes.keys():
-            planner_threads.pop(self.id)
-            return
-        for node in self.deps:
-            if node.try_build() == 1:
-                self.node_queue.append(node)
-        if self.target.read_state() == State.DONE:
-            self.finished = True
-        while not self.finished:
-            while self.node_queue:
-                node = self.node_queue.popleft()
-                resources_lock.acquire()
-                if node.resources.CPU > free_resources.CPU or node.resources.RAM > free_resources.RAM:
-                    resources_lock.release()
-                    self.node_queue.appendleft(node)
-                    break
-                free_resources.CPU -= node.resources.CPU
-                free_resources.RAM -= node.resources.RAM
+    def remove(self):
+        planner_threads_lock.acquire()
+        planner_threads.pop(self.id)
+        planner_threads_lock.release()
+
+    def send_tasks(self):
+        while self.node_queue:
+            node = self.node_queue.popleft()
+            resources_lock.acquire()
+            if node.resources.CPU > free_resources.CPU or node.resources.RAM > free_resources.RAM:
                 resources_lock.release()
-                node.mark_running()
+                self.node_queue.appendleft(node)
+                break
+            free_resources.CPU -= node.resources.CPU
+            free_resources.RAM -= node.resources.RAM
+            resources_lock.release()
+            try:
                 pool.apply_async(
                     func=node.action.run,
                     callback=self.taks_completed,
@@ -363,7 +399,31 @@ class PlannerThread(threading.Thread):
                     err_callback_args=(node,)
                 )
                 self.executed_nodes.add(node)
-            self.notification_queue_semaphore.acquire()
+            except RuntimeError:
+                self.finished = True
+
+    def build(self):
+        if self.target_id not in nodes.keys():
+            print_thread_safe(f"Unknown target: {self.target_id}")
+            print_thread_safe(None)
+            self.remove()
+            return
+        if not self.p:
+            print_thread_safe(None)
+        for node in self.deps:
+            if node.try_build() == 1:
+                self.node_queue_append(node)
+        if self.target.read_state() == State.DONE:
+            self.finished = True
+        self.send_tasks()
+        while not self.finished:
+            if not self.notification_queue_semaphore.acquire(timeout=1):
+                if self.stop_event.is_set():
+                    break
+                else:
+                    continue
+            if self.stop_event.is_set():
+                break
             self.notification_queue_lock.acquire()
             while self.notification_queue:
                 node = self.notification_queue.popleft()
@@ -372,9 +432,13 @@ class PlannerThread(threading.Thread):
                     self.process_notification(node)
                 self.notification_queue_lock.acquire()
             self.notification_queue_lock.release()
-        planner_threads.pop(self.id)
+            self.send_tasks()
+        if self.p:
+            print_thread_safe(None)
+        self.remove()
 
 def clean(target_id=None):
+    print_thread_safe(None)
     queue = deque()
     visited = {id: False for id in nodes.keys()}
     if target_id:
@@ -395,31 +459,140 @@ def clean(target_id=None):
                 visited[neighbor.id] = True
                 queue.append(neighbor)
 
-while True:
+def num_active_planner_threads():
+    planner_threads_lock.acquire()
+    count = len(planner_threads)
+    planner_threads_lock.release()
+    return count
+
+def stats():
+    cnt = {state: 0 for state in State}
+    for node in nodes.values():
+        cnt[node.read_state()] += 1
+    resources_lock.acquire()
+    resources_in_use = Resources(
+        CPU=capacity.CPU - free_resources.CPU,
+        RAM=capacity.RAM - free_resources.RAM
+    )
+    resources_lock.release()
+    current_planner_threads = num_active_planner_threads()
+
+    print_thread_safe(f"Number of nodes: {len(nodes)}")
+    for state in State:
+        print_thread_safe(f"  {state.name}: {cnt[state]}")
+    print_thread_safe(f"Resources in use: CPU {resources_in_use.CPU}/{capacity.CPU}, RAM {resources_in_use.RAM}/{capacity.RAM}")
+    print_thread_safe(f"Active pool workers: {pool.num_active_workers()}/{pool.max_workers}")
+    print_thread_safe(f"Active planner threads: {current_planner_threads}")
+    print_thread_safe(None)
+
+def describe(node_id):
+    if node_id not in nodes.keys():
+        print_thread_safe("Given node does not exist.")
+        print_thread_safe(None)
+        return
+    node = nodes[node_id]
+    inputs = ""
+    for neighbor in node.inverted_edges:
+        for output in neighbor.outputs:
+            if len(inputs) > 0:
+                inputs += ", "
+            inputs += output
+    outputs = ""
+    for output in node.outputs:
+        if len(outputs) > 0:
+                outputs += ", "
+        outputs += output
+    error = node.get_error_message()
+    
+    print_thread_safe(f"State: {node.read_state().name}")
+    print_thread_safe(f"Number of pending dependencies: {node.read_degree()}")
+    print_thread_safe(f"Inputs: {inputs}")
+    print_thread_safe(f"Outputs: {outputs}")
+    print_thread_safe(f"Resources: CPU {node.resources.CPU}, RAM {node.resources.RAM}")
+    if error:
+        print_thread_safe(f"Last error message was:\n{error}")
+    print_thread_safe(None)
+
+def cancel():
+    print_thread_safe(None)
+    stop_event.set()
+    pool.terminate()
+
+def command_input():
     cmd = input("> ").strip().split(maxsplit=1)
     match cmd[0]:
         case "load":
-            if load(cmd[1]):
-                print("Project loaded successfully.")
-            else:
-                print("Failed to load project.")
+            if len(cmd) == 1:
+                print("Usage: load <path.json>")
+                return 1
+            thread = threading.Thread(target=load, args=(cmd[1],))
+            thread.start()
         case "build":
-            thread = PlannerThread(cmd[1])
+            if len(cmd) == 1:
+                print("Usage: build [-p] <target_id>")
+                return 1
+            p = False
+            if cmd[1].startswith("-p "):
+                temp = cmd[1].split(maxsplit=1)
+                cmd[1] = temp[1]
+                p = True
+            thread = PlannerThread(cmd[1], stop_event, p)
+            planner_threads_lock.acquire()
             planner_threads[thread.id] = thread
+            planner_threads_lock.release()
             thread.start()
         case "clean":
-            if planner_threads:
+            if num_active_planner_threads() > 0:
                 print("Builds are in progress. Clean aborted.")
-                continue
+                return 1
             confirmation = input("Are you sure you want to clean all outputs? (y/n): ").strip().lower()
             if confirmation != 'y':
                 print("Clean aborted.")
-                continue
-            clean(cmd[1] if len(cmd) > 1 else None)
-            print("Outputs cleaned.")
+                return 1
+            thread = threading.Thread(target=clean, args=(cmd[1] if len(cmd) > 1 else None,))
+            thread.start()
+        case "stats":
+            thread = threading.Thread(target=stats)
+            thread.start()
+        case "describe":
+            if len(cmd) == 1:
+                print("Usage: describe <node_id>")
+                return 1
+            thread = threading.Thread(target=describe, args={cmd[1]})
+            thread.start()
+        case "cancel":
+            if num_active_planner_threads() == 0:
+                print("No builds are in progress.")
+                return 1
+            thread = threading.Thread(target=cancel)
+            thread.start()
         case "exit":
+            if num_active_planner_threads() > 0:
+                cancel()
             pool.close()
             pool.join()
-            break
+            return 2
         case _:
             print("Unknown command.")
+            return 1
+    return 0
+
+def output():
+    while True:
+        print_queue_semaphore.acquire()
+        print_queue_lock.acquire()
+        while print_queue:
+            message = print_queue.popleft()
+            if not message:
+                print_queue_lock.release()
+                return
+            print(message)
+        print_queue_lock.release()
+
+while True:
+    result = command_input()
+    if result == 2:
+        break
+    if result == 1:
+        continue
+    output()
