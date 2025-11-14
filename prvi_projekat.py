@@ -24,7 +24,10 @@ class ShellAction(Action):
     
     def run(self):
         import subprocess
-        return subprocess.run(self.cmd, shell=True, cwd=directory, capture_output=True, text=True)
+        result = subprocess.run(self.cmd, shell=True, cwd=directory, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(result.stderr)
+        return result.stdout
         
 class ScriptAction(ShellAction):
     def __init__(self, cmd):
@@ -36,7 +39,10 @@ class PythonAction(Action):
 
     def run(self):
         import subprocess
-        return subprocess.run(["py", self.cmd], cwd=directory, capture_output=True, text=True)
+        result = subprocess.run(["py", self.cmd], cwd=directory, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(result.stderr)
+        return result.stdout
 
 class CAction(Action):
     def __init__(self, cmd):
@@ -48,13 +54,16 @@ class CAction(Action):
 
         compiler = shutil.which("gcc") or shutil.which("clang")
         if not compiler:
-            raise EnvironmentError("No C compiler found in PATH.")
+            raise EnvironmentError("No C compiler found in PATH")
         base, _ = os.path.splitext(self.cmd)
         executable = base + (".exe" if os.name == "nt" else "")
         result = subprocess.run([compiler, self.cmd, "-o", executable], cwd=directory, capture_output=True, text=True)
         if result.returncode != 0:
-            return result
-        return subprocess.run([("" if os.name == "nt" else "./") + executable], cwd=directory, shell=True, capture_output=True, text=True)
+            raise Exception(result.stderr)
+        result = subprocess.run([("" if os.name == "nt" else "./") + executable], cwd=directory, shell=True, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(result.stderr)
+        return result.stdout
 
 class ActionFactory:
     @staticmethod
@@ -125,10 +134,9 @@ class Node:
         self.mutex.acquire()
         self.state = State.PENDING if self.degree > 0 else State.READY
         self.mutex.release()
-        for neighbor in self.edges:
-            neighbor.mutex.acquire()
-            neighbor.degree += 1
-            neighbor.mutex.release()
+        self.error_message_lock.acquire()
+        self.error_message = None
+        self.error_message_lock.release()
         for output in self.outputs:
             output_path = os.path.join(directory, output)
             if os.path.isfile(output_path):
@@ -136,6 +144,10 @@ class Node:
             elif os.path.isdir(output_path):
                 import shutil
                 shutil.rmtree(output_path)
+        for neighbor in self.edges:
+            neighbor.mutex.acquire()
+            neighbor.degree += 1
+            neighbor.mutex.release()
 
     def read_state(self):
         self.mutex.acquire()
@@ -159,6 +171,36 @@ class Node:
         message = self.error_message
         self.error_message_lock.release()
         return message
+    
+class Future:
+    def __init__(self):
+        self.res_event = threading.Event()
+        self.exc_event = threading.Event()
+        self.res = None
+        self.exc = None
+
+    def set_result(self, res):
+        self.res = res
+        self.res_event.set()
+
+    def set_exception(self, exc):
+        self.exc = exc
+        self.exc_event.set()
+
+    def result(self, timeout=None):
+        flag = self.res_event.wait(timeout)
+        if flag:
+            return self.res
+        raise TimeoutError()
+    
+    def exception(self, timeout=None):
+        flag = self.exc_event.wait(timeout)
+        if flag:
+            return self.exc
+        raise TimeoutError()
+    
+    def done(self):
+        return self.res_event.is_set()
 
 class RAFThreadPool:
     def __init__(self, max_workers):
@@ -183,15 +225,21 @@ class RAFThreadPool:
             self.callback_args = callback_args
             self.err_callback = err_callback
             self.err_callback_args = err_callback_args
+            self.future = Future()
 
         def execute(self):
-            result = self.func(*self.args)
-            if result.returncode == 0:
+            try:
+                result = self.func(*self.args)
+                self.future.set_result(result)
+                self.future.set_exception(None)
                 if self.callback:
                     self.callback(result, *self.callback_args)
-            else:
+            except Exception as e:
+                self.future.set_exception(str(e))
+                self.future.set_result(None)
                 if self.err_callback:
-                    self.err_callback(result, *self.err_callback_args)
+                    self.err_callback(str(e), *self.err_callback_args)
+            
 
     def worker(self):
         while True:
@@ -213,19 +261,20 @@ class RAFThreadPool:
             
     def apply_async(self, func, args=(), callback=None, callback_args=(), err_callback=None, err_callback_args=()):
         if self.closed:
-            raise RuntimeError("Pool has been closed.")
+            raise RuntimeError("Pool has been closed")
         task = self.Task(func, args, callback, callback_args, err_callback, err_callback_args)
         self.queue_lock.acquire()
         self.queue.append(task)
         self.queue_lock.release()
         self.semaphore.release()
+        return task.future
 
     def close(self):
         self.closed = True
 
     def join(self):
         if not self.closed:
-            raise RuntimeError("Cannot join on an open pool.")
+            raise RuntimeError("Cannot join on an open pool")
         for worker in self.workers:
             worker.join()
 
@@ -333,14 +382,16 @@ class PlannerThread(threading.Thread):
     def taks_completed(self, _, node):
         node.set_state(State.DONE)
         if self.p:
-            print_thread_safe(f"{node.id} completed.")
+            print_thread_safe(f"{node.id} completed")
+        for neighbor in node.edges:
+            neighbor.update(1)
         self.task_executed(node)
     
     def task_failed(self, result, node):
         node.set_state(State.FAILED)
         if self.p:
-            print_thread_safe(f"{node.id} failed with error code {result.returncode}.")
-        node.set_error_message(result.stderr)
+            print_thread_safe(f"{node.id} failed with error:\n{result}")
+        node.set_error_message(result)
         self.task_executed(node)
     
     def task_executed(self, node):
@@ -363,9 +414,6 @@ class PlannerThread(threading.Thread):
     def process_notification(self, node):
         if node.read_state() == State.FAILED or node.id == self.target_id:
             self.finished = True
-        if node in self.executed_nodes:
-            for neighbor in node.edges:
-                neighbor.update(1)
         for neighbor in node.edges:
             if neighbor in self.deps:
                 result = neighbor.try_build()
@@ -487,7 +535,7 @@ def stats():
 
 def describe(node_id):
     if node_id not in nodes.keys():
-        print_thread_safe("Given node does not exist.")
+        print_thread_safe(f"Unknown node: {node_id}")
         print_thread_safe(None)
         return
     node = nodes[node_id]
@@ -529,7 +577,8 @@ def command_input():
             thread.start()
         case "build":
             if len(cmd) == 1:
-                print("Usage: build [-p] <target_id>")
+                print("Usage: build [options] <target_id>\nOptions:\n" \
+                    "\t-p: print tasks when executed (I/O will be blocked for the duration of the build)")
                 return 1
             p = False
             if cmd[1].startswith("-p "):
@@ -543,11 +592,11 @@ def command_input():
             thread.start()
         case "clean":
             if num_active_planner_threads() > 0:
-                print("Builds are in progress. Clean aborted.")
+                print("Builds are in progress. Clean aborted")
                 return 1
             confirmation = input("Are you sure you want to clean all outputs? (y/n): ").strip().lower()
             if confirmation != 'y':
-                print("Clean aborted.")
+                print("Clean aborted")
                 return 1
             thread = threading.Thread(target=clean, args=(cmd[1] if len(cmd) > 1 else None,))
             thread.start()
@@ -558,11 +607,11 @@ def command_input():
             if len(cmd) == 1:
                 print("Usage: describe <node_id>")
                 return 1
-            thread = threading.Thread(target=describe, args={cmd[1]})
+            thread = threading.Thread(target=describe, args=(cmd[1],))
             thread.start()
         case "cancel":
             if num_active_planner_threads() == 0:
-                print("No builds are in progress.")
+                print("No builds are in progress")
                 return 1
             thread = threading.Thread(target=cancel)
             thread.start()
@@ -573,7 +622,7 @@ def command_input():
             pool.join()
             return 2
         case _:
-            print("Unknown command.")
+            print("Unknown command")
             return 1
     return 0
 
