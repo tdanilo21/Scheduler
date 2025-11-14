@@ -34,8 +34,11 @@ class PythonAction(Action):
         super().__init__(cmd, cwd)
 
     def run(self):
-        compiler = "py" if os.name == "nt" else "python"
         import subprocess
+        import shutil
+        compiler = shutil.which("py") or shutil.which("python")
+        if not compiler:
+            raise EnvironmentError("No python compiler found in PATH")
         result = subprocess.run([compiler, self.cmd], cwd=self.cwd, capture_output=True, text=True)
         if result.returncode != 0:
             raise Exception(result.stderr)
