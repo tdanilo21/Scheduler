@@ -354,7 +354,6 @@ class PlannerThread(threading.Thread):
     def __init__(self, target_id, stop_event, p):
         super().__init__(target=self.build)
         self.target_id = target_id
-        self.target = nodes[self.target_id]
         self.stop_event = stop_event
         self.p = p
         PlannerThread.counter_lock.acquire()
@@ -368,6 +367,11 @@ class PlannerThread(threading.Thread):
         self.executed_nodes = set()
         self.deps = set()
         self.finished = False
+        self.unknown = False
+        if target_id not in nodes.keys():
+            self.unknown = True
+            return
+        self.target = nodes[self.target_id]
 
         q = deque()
         self.deps.add(self.target)
@@ -451,7 +455,7 @@ class PlannerThread(threading.Thread):
                 self.finished = True
 
     def build(self):
-        if self.target_id not in nodes.keys():
+        if self.unknown:
             print_thread_safe(f"Unknown target: {self.target_id}")
             print_thread_safe(None)
             self.remove()
@@ -585,6 +589,8 @@ def command_input():
                 temp = cmd[1].split(maxsplit=1)
                 cmd[1] = temp[1]
                 p = True
+            if cmd[1].startswith("\"") and cmd[1].endswith("\""):
+                cmd[1] = cmd[1][1:-1]
             thread = PlannerThread(cmd[1], stop_event, p)
             planner_threads_lock.acquire()
             planner_threads[thread.id] = thread
