@@ -9,7 +9,7 @@
       "id": "make dir data",
       "deps": [],
       "action": {
-        "type": "script",
+        "type": "shell",
         "cmd": "script.cmd"
       },
       "outputs": ["data/", "data/example.txt"],
